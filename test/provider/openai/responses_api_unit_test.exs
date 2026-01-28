@@ -308,6 +308,152 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["text"]["format"]["strict"] == true
       assert body["text"]["format"]["schema"] == json_schema
     end
+
+    test "encodes tool call conversation with full history" do
+      # Simulate a full tool call conversation:
+      # User asks -> Assistant calls tool -> Tool responds -> Assistant answers
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "What's the weather?"}]
+      }
+
+      assistant_tool_call = %ReqLLM.Message{
+        role: :assistant,
+        content: [],
+        tool_calls: [
+          ReqLLM.ToolCall.new("call_123", "get_weather", ~s({"location":"NYC"}))
+        ]
+      }
+
+      tool_result = %ReqLLM.Message{
+        role: :tool,
+        tool_call_id: "call_123",
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Sunny, 72F"}]
+      }
+
+      user_followup = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Thanks!"}]
+      }
+
+      context = %ReqLLM.Context{messages: [user_msg, assistant_tool_call, tool_result, user_followup]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      # Should NOT use previous_response_id
+      refute Map.has_key?(body, "previous_response_id")
+
+      # Should encode full conversation in input array
+      assert [input1, input2, input3, input4] = body["input"]
+
+      # First user message
+      assert input1["role"] == "user"
+      assert input1["content"] == [%{"type" => "input_text", "text" => "What's the weather?"}]
+
+      # Assistant tool call (function_call item, no role)
+      assert input2["type"] == "function_call"
+      assert input2["call_id"] == "call_123"
+      assert input2["name"] == "get_weather"
+      assert input2["arguments"] == ~s({"location":"NYC"})
+
+      # Tool result (function_call_output)
+      assert input3["type"] == "function_call_output"
+      assert input3["call_id"] == "call_123"
+      assert input3["output"] == "Sunny, 72F"
+
+      # Second user message
+      assert input4["role"] == "user"
+      assert input4["content"] == [%{"type" => "input_text", "text" => "Thanks!"}]
+    end
+
+    test "encodes assistant message with both text and tool calls" do
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Let me check that."}],
+        tool_calls: [
+          ReqLLM.ToolCall.new("call_abc", "search", ~s({"query":"test"}))
+        ]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert [input1, input2] = body["input"]
+
+      # Text content part
+      assert input1["role"] == "assistant"
+      assert input1["content"] == [%{"type" => "output_text", "text" => "Let me check that."}]
+
+      # Tool call part
+      assert input2["type"] == "function_call"
+      assert input2["call_id"] == "call_abc"
+      assert input2["name"] == "search"
+    end
+
+    test "encodes multiple tool calls in parallel" do
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [],
+        tool_calls: [
+          ReqLLM.ToolCall.new("call_1", "get_weather", ~s({"location":"NYC"})),
+          ReqLLM.ToolCall.new("call_2", "get_time", ~s({"timezone":"EST"}))
+        ]
+      }
+
+      tool_result_1 = %ReqLLM.Message{
+        role: :tool,
+        tool_call_id: "call_1",
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Sunny"}]
+      }
+
+      tool_result_2 = %ReqLLM.Message{
+        role: :tool,
+        tool_call_id: "call_2",
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "3:00 PM"}]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg, tool_result_1, tool_result_2]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert [tc1, tc2, tr1, tr2] = body["input"]
+
+      # Two tool calls
+      assert tc1["type"] == "function_call"
+      assert tc1["call_id"] == "call_1"
+      assert tc2["type"] == "function_call"
+      assert tc2["call_id"] == "call_2"
+
+      # Two tool results
+      assert tr1["type"] == "function_call_output"
+      assert tr1["call_id"] == "call_1"
+      assert tr2["type"] == "function_call_output"
+      assert tr2["call_id"] == "call_2"
+    end
+
+    test "encodes system message correctly" do
+      system_msg = %ReqLLM.Message{
+        role: :system,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "You are a helpful assistant."}]
+      }
+
+      context = %ReqLLM.Context{messages: [system_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert [input1] = body["input"]
+      assert input1["role"] == "system"
+      assert input1["content"] == [%{"type" => "input_text", "text" => "You are a helpful assistant."}]
+    end
   end
 
   describe "decode_response/1" do
@@ -859,7 +1005,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert reasoning_input["encrypted_content"] == "encrypted_sig_abc"
     end
 
-    test "does not include reasoning items when previous_response_id is present" do
+    test "includes full conversation history without previous_response_id" do
       reasoning_detail = %ReqLLM.Message.ReasoningDetails{
         text: "Previous reasoning",
         signature: "encrypted_sig",
@@ -888,10 +1034,21 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       encoded = ResponsesAPI.encode_body(request)
       body = Jason.decode!(encoded.body)
 
-      assert body["previous_response_id"] == "resp_prev_123"
+      # Should NOT use previous_response_id
+      refute Map.has_key?(body, "previous_response_id")
 
-      refute Enum.any?(body["input"], fn item ->
+      # Should include reasoning items in input
+      assert Enum.any?(body["input"], fn item ->
                item["type"] == "reasoning"
+             end)
+
+      # Should include assistant message and user message
+      assert Enum.any?(body["input"], fn item ->
+               item["role"] == "assistant"
+             end)
+
+      assert Enum.any?(body["input"], fn item ->
+               item["role"] == "user"
              end)
     end
 

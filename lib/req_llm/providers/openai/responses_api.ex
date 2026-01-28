@@ -222,74 +222,105 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     end
   end
 
+  # Converts a ReqLLM.Message to Responses API input items
+  defp encode_message_to_responses_input(%ReqLLM.Message{role: :user} = msg) do
+    content =
+      Enum.flat_map(msg.content, fn part ->
+        encode_input_content_part(part, "input_text")
+      end)
+
+    if content == [] do
+      []
+    else
+      [%{"role" => "user", "content" => content}]
+    end
+  end
+
+  defp encode_message_to_responses_input(%ReqLLM.Message{role: :system} = msg) do
+    content =
+      Enum.flat_map(msg.content, fn part ->
+        encode_input_content_part(part, "input_text")
+      end)
+
+    if content == [] do
+      []
+    else
+      [%{"role" => "system", "content" => content}]
+    end
+  end
+
+  defp encode_message_to_responses_input(%ReqLLM.Message{role: :assistant} = msg) do
+    items = []
+
+    # Add text content if present (first)
+    text_content =
+      Enum.flat_map(msg.content, fn part ->
+        encode_input_content_part(part, "output_text")
+      end)
+
+    items =
+      if text_content != [] do
+        items ++ [%{"role" => "assistant", "content" => text_content}]
+      else
+        items
+      end
+
+    # Add tool calls if present (after text)
+    items =
+      if msg.tool_calls != nil and msg.tool_calls != [] do
+        tool_call_items =
+          Enum.map(msg.tool_calls, fn tc ->
+            %{
+              "type" => "function_call",
+              "call_id" => tc.id,
+              "name" => tc.function.name,
+              "arguments" => tc.function.arguments
+            }
+          end)
+
+        items ++ tool_call_items
+      else
+        items
+      end
+
+    items
+  end
+
+  defp encode_message_to_responses_input(%ReqLLM.Message{role: :tool} = msg) do
+    output_text =
+      msg.content
+      |> Enum.find_value(fn part ->
+        if part.type == :text, do: part.text
+      end) || ""
+
+    [
+      %{
+        "type" => "function_call_output",
+        "call_id" => msg.tool_call_id,
+        "output" => output_text
+      }
+    ]
+  end
+
   defp build_request_body(context, model_name, opts, request) do
     opts_map = if is_map(opts), do: opts, else: Map.new(opts)
     provider_opts = opts_map[:provider_options] || []
 
-    previous_response_id =
-      provider_opts[:previous_response_id] ||
-        extract_previous_response_id_from_context(context)
+    # Encode all messages in order as input items
+    # This replaces the old previous_response_id approach
+    input = context.messages |> Enum.flat_map(&encode_message_to_responses_input/1)
 
-    {input, tool_messages, reasoning_items} =
-      Enum.reduce(context.messages, {[], [], []}, fn msg, {input_acc, tool_acc, reasoning_acc} ->
-        case msg.role do
-          :tool ->
-            {input_acc, [msg | tool_acc], reasoning_acc}
+    # Extract reasoning details to prepend if present
+    reasoning_items =
+      context.messages
+      |> Enum.flat_map(&encode_reasoning_details_from_message/1)
 
-          :assistant ->
-            new_reasoning = encode_reasoning_details_from_message(msg)
-            content_type = "output_text"
-
-            content =
-              Enum.flat_map(msg.content, fn part ->
-                encode_input_content_part(part, content_type)
-              end)
-
-            if content == [] and msg.tool_calls == nil do
-              {input_acc, tool_acc, reasoning_acc ++ new_reasoning}
-            else
-              if msg.tool_calls != nil and msg.tool_calls != [] do
-                {input_acc, tool_acc, reasoning_acc ++ new_reasoning}
-              else
-                {input_acc ++ [%{"role" => "assistant", "content" => content}], tool_acc,
-                 reasoning_acc ++ new_reasoning}
-              end
-            end
-
-          _ ->
-            content =
-              Enum.flat_map(msg.content, fn part ->
-                encode_input_content_part(part, "input_text")
-              end)
-
-            if content == [] do
-              {input_acc, tool_acc, reasoning_acc}
-            else
-              {input_acc ++ [%{"role" => Atom.to_string(msg.role), "content" => content}],
-               tool_acc, reasoning_acc}
-            end
-        end
-      end)
-
-    pending_tool_call_ids = find_pending_tool_call_ids(context.messages)
-
-    tool_outputs_from_context =
-      tool_messages
-      |> Enum.reverse()
-      |> Enum.filter(fn msg -> msg.tool_call_id in pending_tool_call_ids end)
-      |> extract_tool_outputs_from_messages()
-
-    tool_outputs =
-      case provider_opts[:tool_outputs] do
-        nil -> tool_outputs_from_context
-        [] -> tool_outputs_from_context
-        explicit_outputs -> explicit_outputs
-      end
-
-    input =
-      case tool_outputs do
-        [] -> input
-        outputs -> input ++ encode_tool_outputs(outputs)
+    # Prepend reasoning items if present
+    final_input =
+      if reasoning_items != [] do
+        reasoning_items ++ input
+      else
+        input
       end
 
     max_output_tokens =
@@ -306,30 +337,17 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     text_format = encode_text_format(provider_opts[:response_format])
 
-    final_input =
-      if previous_response_id == nil and reasoning_items != [] do
-        reasoning_items ++ input
-      else
-        input
-      end
-
-    body =
-      Map.new()
-      |> Map.put("model", model_name)
-      |> Map.put("input", final_input)
-      |> maybe_put_string("stream", opts_map[:stream])
-      |> maybe_put_string("max_output_tokens", max_output_tokens)
-      |> maybe_put_string("reasoning", reasoning)
-      |> maybe_put_string("tools", tools)
-      |> maybe_put_string("tool_choice", tool_choice)
-      |> maybe_put_string("service_tier", service_tier)
-      |> maybe_put_string("text", text_format)
-
-    if previous_response_id do
-      Map.put(body, "previous_response_id", previous_response_id)
-    else
-      body
-    end
+    # Build body without previous_response_id
+    Map.new()
+    |> Map.put("model", model_name)
+    |> Map.put("input", final_input)
+    |> maybe_put_string("stream", opts_map[:stream])
+    |> maybe_put_string("max_output_tokens", max_output_tokens)
+    |> maybe_put_string("reasoning", reasoning)
+    |> maybe_put_string("tools", tools)
+    |> maybe_put_string("tool_choice", tool_choice)
+    |> maybe_put_string("service_tier", service_tier)
+    |> maybe_put_string("text", text_format)
   end
 
   defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do
@@ -519,93 +537,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp maybe_put_string(map, _key, nil), do: map
   defp maybe_put_string(map, key, value), do: Map.put(map, key, value)
-
-  # Extract the most recent response_id from assistant messages.
-  # This should be the LAST assistant message, not specifically one with tool_calls.
-  # The response_id creates a chain: A -> B -> C, and we need to continue from the
-  # most recent response in the chain.
-  defp extract_previous_response_id_from_context(context) do
-    context.messages
-    |> Enum.reverse()
-    |> Enum.find_value(fn msg ->
-      case msg do
-        %{role: :assistant, metadata: %{response_id: id}} when is_binary(id) ->
-          id
-
-        _ ->
-          nil
-      end
-    end)
-  end
-
-  # Find tool_call_ids that need their outputs sent.
-  # A tool output needs to be sent if:
-  # 1. There's a tool message with that call_id
-  # 2. AND there's no assistant message AFTER that tool message (meaning the output hasn't been consumed yet)
-  #
-  # Flow: assistant(tool_calls) → tool(result) → [assistant(answer)] OR [no response yet]
-  # If the assistant(answer) exists, the tool output was already sent.
-  # If it doesn't exist, we need to send the tool output.
-  defp find_pending_tool_call_ids(messages) do
-    # Process messages in reverse order to find:
-    # 1. All tool messages that appear AFTER the last assistant message
-    # These are tool outputs that haven't been sent yet
-    messages
-    |> Enum.reverse()
-    |> Enum.reduce_while([], fn msg, acc ->
-      case msg.role do
-        :tool when is_binary(msg.tool_call_id) ->
-          # This tool message appears before any assistant response
-          # (in reverse order means it's after all assistants in forward order)
-          {:cont, [msg.tool_call_id | acc]}
-
-        :assistant ->
-          # We hit an assistant message - any tool messages before this (in reverse)
-          # have already been sent, so stop collecting
-          {:halt, acc}
-
-        _ ->
-          {:cont, acc}
-      end
-    end)
-  end
-
-  defp extract_tool_outputs_from_messages(tool_messages) do
-    Enum.map(tool_messages, fn msg ->
-      output_text =
-        msg.content
-        |> Enum.find_value(fn part ->
-          if part.type == :text, do: part.text
-        end) || ""
-
-      %{
-        call_id: msg.tool_call_id,
-        output: output_text
-      }
-    end)
-  end
-
-  defp encode_tool_outputs(outputs) when is_list(outputs) do
-    Enum.map(outputs, fn output ->
-      call_id = output[:call_id] || output["call_id"]
-      raw_output = output[:output] || output["output"]
-
-      output_string =
-        cond do
-          is_binary(raw_output) -> raw_output
-          is_map(raw_output) or is_list(raw_output) -> Jason.encode!(raw_output)
-          true -> to_string(raw_output)
-        end
-
-      %{
-        "type" => "function_call_output",
-        "call_id" => call_id,
-        "output" => output_string
-      }
-    end)
-  end
-
-  defp encode_tool_outputs(_), do: []
 
   defp encode_tools_if_any(request) do
     case request.options[:tools] do
