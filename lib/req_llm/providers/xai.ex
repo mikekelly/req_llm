@@ -310,7 +310,7 @@ defmodule ReqLLM.Providers.XAI do
   """
   @spec supports_native_structured_outputs?(LLMDB.Model.t() | binary()) :: boolean()
   def supports_native_structured_outputs?(%LLMDB.Model{} = model) do
-    case get_in(model, [Access.key(:capabilities, %{}), :native_json_schema]) do
+    case get_in(model.capabilities || %{}, [:native_json_schema]) do
       nil -> supports_native_structured_outputs?(model.id)
       value -> value
     end

@@ -273,8 +273,7 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
     {reasoning_budget, opts} = Keyword.pop(opts, :reasoning_token_budget)
 
     has_reasoning =
-      get_in(model, [Access.key(:capabilities), Access.key(:reasoning), Access.key(:enabled)]) ==
-        true
+      get_in(model.capabilities || %{}, [:reasoning, :enabled]) == true
 
     cond do
       has_reasoning && reasoning_budget && is_integer(reasoning_budget) ->

@@ -977,7 +977,7 @@ defmodule ReqLLM.Providers.Azure do
   # Checks if a model uses the Responses API (based on model.extra.wire.protocol metadata).
   # The model metadata should have `extra: %{wire: %{protocol: "openai_responses"}}` for Responses API models.
   defp uses_responses_api?(%LLMDB.Model{} = model) do
-    get_in(model, [Access.key(:extra, %{}), :wire, :protocol]) == "openai_responses"
+    get_in(model.extra || %{}, [:wire, :protocol]) == "openai_responses"
   end
 
   # Determines the model family (claude, gpt-4o, o1, etc.) from a model ID.

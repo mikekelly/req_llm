@@ -551,7 +551,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     case ReqLLM.model("openai:#{model_name}") do
       {:ok, model} ->
-        category = get_in(model, [Access.key(:extra, %{}), :category])
+        category = get_in(model.extra || %{}, [:category])
 
         case category do
           "deep_research" ->
