@@ -251,19 +251,32 @@ defmodule ReqLLM.Providers.OpenAI do
 
       timeout = get_timeout_for_operation(:image, processed_opts)
 
-      request =
-        Req.new(
-          [
-            url: path,
-            method: :post,
-            receive_timeout: timeout,
-            pool_timeout: timeout,
-            connect_options: [timeout: timeout]
-          ] ++ http_opts
-        )
+      # Extract finch option from http_opts to avoid conflict with connect_options
+      # (Req raises ArgumentError if both :finch and :connect_options are set)
+      {finch_opt, remaining_http_opts} = Keyword.pop(http_opts, :finch)
+
+      base_opts = [
+        url: path,
+        method: :post,
+        receive_timeout: timeout,
+        pool_timeout: timeout
+      ]
+
+      base_opts =
+        if finch_opt do
+          Keyword.put(base_opts, :finch, finch_opt)
+        else
+          Keyword.put(base_opts, :connect_options, [timeout: timeout])
+        end
+
+      # Remove :req_http_options entirely from processed_opts to avoid conflicts
+      # We've already applied the http_opts directly to base_opts above
+      processed_opts_cleaned = Keyword.delete(processed_opts, :req_http_options)
+
+      request = Req.new(base_opts ++ remaining_http_opts)
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(
-          Keyword.take(processed_opts, req_keys) ++
+          Keyword.take(processed_opts_cleaned, req_keys) ++
             [
               operation: :image,
               model: model.id,
@@ -273,7 +286,7 @@ defmodule ReqLLM.Providers.OpenAI do
               api_mod: api_mod
             ]
         )
-        |> attach(model, processed_opts)
+        |> attach(model, processed_opts_cleaned)
 
       {:ok, request}
     end
@@ -306,26 +319,41 @@ defmodule ReqLLM.Providers.OpenAI do
 
       timeout = get_timeout_for_model(api_mod, processed_opts)
 
-      request =
-        Req.new(
-          [
-            url: path,
-            method: :post,
-            receive_timeout: timeout,
-            pool_timeout: timeout,
-            connect_options: [timeout: timeout]
-          ] ++ http_opts
-        )
+      # Extract finch option from http_opts to avoid conflict with connect_options
+      # (Req raises ArgumentError if both :finch and :connect_options are set)
+      {finch_opt, remaining_http_opts} = Keyword.pop(http_opts, :finch)
+
+      base_opts = [
+        url: path,
+        method: :post,
+        receive_timeout: timeout,
+        pool_timeout: timeout
+      ]
+
+      base_opts =
+        if finch_opt do
+          Keyword.put(base_opts, :finch, finch_opt)
+        else
+          Keyword.put(base_opts, :connect_options, [timeout: timeout])
+        end
+
+      # Remove :req_http_options entirely from processed_opts to avoid conflicts
+      # We've already applied the http_opts directly to base_opts above
+      processed_opts_cleaned = Keyword.delete(processed_opts, :req_http_options)
+
+      request = Req.new(base_opts ++ remaining_http_opts)
         |> Req.Request.register_options(req_keys)
         |> Req.Request.merge_options(
-          Keyword.take(processed_opts, req_keys) ++
+          Keyword.take(processed_opts_cleaned, req_keys) ++
             [
               model: model.id,
               base_url: Keyword.get(processed_opts, :base_url, base_url()),
               api_mod: api_mod
             ]
         )
-        |> attach(model, processed_opts)
+        |> attach(model, processed_opts_cleaned)
+
+      {:ok, request}
 
       {:ok, request}
     end
