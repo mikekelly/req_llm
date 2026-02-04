@@ -230,6 +230,23 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     end
   end
 
+  defp extract_instructions_from_system_messages([]), do: nil
+
+  defp extract_instructions_from_system_messages(system_messages) do
+    system_messages
+    |> Enum.map(fn msg ->
+      msg.content
+      |> Enum.filter(&(&1.type == :text))
+      |> Enum.map(& &1.text)
+      |> Enum.join("")
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> case do
+      [] -> nil
+      texts -> Enum.join(texts, "\n\n")
+    end
+  end
+
   # Converts a ReqLLM.Message to Responses API input items
   defp encode_message_to_responses_input(%ReqLLM.Message{role: :user} = msg) do
     content =
@@ -241,19 +258,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       []
     else
       [%{"role" => "user", "content" => content}]
-    end
-  end
-
-  defp encode_message_to_responses_input(%ReqLLM.Message{role: :system} = msg) do
-    content =
-      Enum.flat_map(msg.content, fn part ->
-        encode_input_content_part(part, "input_text")
-      end)
-
-    if content == [] do
-      []
-    else
-      [%{"role" => "system", "content" => content}]
     end
   end
 
@@ -314,16 +318,17 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     opts_map = if is_map(opts), do: opts, else: Map.new(opts)
     provider_opts = opts_map[:provider_options] || []
 
-    # Encode all messages in order as input items
-    # This replaces the old previous_response_id approach
-    input = context.messages |> Enum.flat_map(&encode_message_to_responses_input/1)
+    system_messages = Enum.filter(context.messages, &(&1.role == :system))
+    non_system_messages = Enum.reject(context.messages, &(&1.role == :system))
 
-    # Extract reasoning details to prepend if present
+    instructions = extract_instructions_from_system_messages(system_messages)
+
+    input = non_system_messages |> Enum.flat_map(&encode_message_to_responses_input/1)
+
     reasoning_items =
-      context.messages
+      non_system_messages
       |> Enum.flat_map(&encode_reasoning_details_from_message/1)
 
-    # Prepend reasoning items if present
     final_input =
       if reasoning_items != [] do
         reasoning_items ++ input
@@ -345,8 +350,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     text_format = encode_text_format(provider_opts[:response_format])
 
-    # Build body without previous_response_id
-    # Default store to false for ChatGPT Codex endpoint (which requires it)
     store =
       cond do
         opts_map[:store] != nil -> opts_map[:store]
@@ -358,6 +361,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     Map.new()
     |> Map.put("model", model_name)
     |> Map.put("input", final_input)
+    |> maybe_put_string("instructions", instructions)
     |> maybe_put_string("stream", opts_map[:stream])
     |> maybe_put_string("max_output_tokens", max_output_tokens)
     |> maybe_put_string("reasoning", reasoning)

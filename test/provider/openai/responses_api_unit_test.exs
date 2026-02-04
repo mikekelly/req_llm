@@ -438,7 +438,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert tr2["call_id"] == "call_2"
     end
 
-    test "encodes system message correctly" do
+    test "encodes system message into instructions field" do
       system_msg = %ReqLLM.Message{
         role: :system,
         content: [%ReqLLM.Message.ContentPart{type: :text, text: "You are a helpful assistant."}]
@@ -450,9 +450,52 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       encoded = ResponsesAPI.encode_body(request)
       body = Jason.decode!(encoded.body)
 
+      assert body["instructions"] == "You are a helpful assistant."
+      assert body["input"] == []
+    end
+
+    test "encodes multiple system messages into concatenated instructions" do
+      system_msg1 = %ReqLLM.Message{
+        role: :system,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "You are a helpful assistant."}]
+      }
+
+      system_msg2 = %ReqLLM.Message{
+        role: :system,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Be concise."}]
+      }
+
+      context = %ReqLLM.Context{messages: [system_msg1, system_msg2]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["instructions"] == "You are a helpful assistant.\n\nBe concise."
+      assert body["input"] == []
+    end
+
+    test "encodes system and user messages correctly" do
+      system_msg = %ReqLLM.Message{
+        role: :system,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "You are helpful."}]
+      }
+
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Hello"}]
+      }
+
+      context = %ReqLLM.Context{messages: [system_msg, user_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["instructions"] == "You are helpful."
       assert [input1] = body["input"]
-      assert input1["role"] == "system"
-      assert input1["content"] == [%{"type" => "input_text", "text" => "You are a helpful assistant."}]
+      assert input1["role"] == "user"
+      assert input1["content"] == [%{"type" => "input_text", "text" => "Hello"}]
     end
   end
 
