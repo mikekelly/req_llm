@@ -209,10 +209,18 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp build_request_headers(model, opts) do
     api_key = ReqLLM.Keys.get!(model, opts)
 
-    [
+    base_headers = [
       {"Authorization", "Bearer " <> api_key},
       {"Content-Type", "application/json"}
     ]
+
+    # Merge extra headers from req_http_options
+    extra_headers =
+      opts
+      |> Keyword.get(:req_http_options, [])
+      |> Keyword.get(:headers, [])
+
+    base_headers ++ extra_headers
   end
 
   defp build_request_url(opts) do
