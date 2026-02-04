@@ -346,6 +346,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     text_format = encode_text_format(provider_opts[:response_format])
 
     # Build body without previous_response_id
+    store = if opts_map[:store] != nil, do: opts_map[:store], else: provider_opts[:store]
+
     Map.new()
     |> Map.put("model", model_name)
     |> Map.put("input", final_input)
@@ -356,6 +358,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     |> maybe_put_string("tool_choice", tool_choice)
     |> maybe_put_string("service_tier", service_tier)
     |> maybe_put_string("text", text_format)
+    |> maybe_put_string("store", store)
   end
 
   defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do
