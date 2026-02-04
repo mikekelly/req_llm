@@ -350,26 +350,36 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     text_format = encode_text_format(provider_opts[:response_format])
 
+    is_codex = is_codex_endpoint?(opts_map[:base_url])
+
     store =
       cond do
         opts_map[:store] != nil -> opts_map[:store]
         provider_opts[:store] != nil -> provider_opts[:store]
-        is_codex_endpoint?(opts_map[:base_url]) -> false
+        is_codex -> false
         true -> nil
       end
 
-    Map.new()
-    |> Map.put("model", model_name)
-    |> Map.put("input", final_input)
-    |> maybe_put_string("instructions", instructions)
-    |> maybe_put_string("stream", opts_map[:stream])
-    |> maybe_put_string("max_output_tokens", max_output_tokens)
-    |> maybe_put_string("reasoning", reasoning)
-    |> maybe_put_string("tools", tools)
-    |> maybe_put_string("tool_choice", tool_choice)
-    |> maybe_put_string("service_tier", service_tier)
-    |> maybe_put_string("text", text_format)
-    |> maybe_put_string("store", store)
+    body =
+      Map.new()
+      |> Map.put("model", model_name)
+      |> Map.put("input", final_input)
+      |> maybe_put_string("instructions", instructions)
+      |> maybe_put_string("stream", opts_map[:stream])
+      |> maybe_put_string("max_output_tokens", max_output_tokens)
+      |> maybe_put_string("reasoning", reasoning)
+      |> maybe_put_string("tools", tools)
+      |> maybe_put_string("tool_choice", tool_choice)
+      |> maybe_put_string("service_tier", service_tier)
+      |> maybe_put_string("text", text_format)
+      |> maybe_put_string("store", store)
+
+    # Codex endpoint doesn't support max_output_tokens
+    if is_codex do
+      Map.delete(body, "max_output_tokens")
+    else
+      body
+    end
   end
 
   defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do

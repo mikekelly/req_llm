@@ -497,6 +497,33 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert input1["role"] == "user"
       assert input1["content"] == [%{"type" => "input_text", "text" => "Hello"}]
     end
+
+    test "strips max_output_tokens for Codex endpoint" do
+      request =
+        build_request(
+          max_output_tokens: 1000,
+          base_url: "https://chatgpt.com/backend-api/codex/responses"
+        )
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      refute Map.has_key?(body, "max_output_tokens")
+      assert body["model"] == "gpt-5"
+    end
+
+    test "keeps max_output_tokens for non-Codex endpoint" do
+      request =
+        build_request(
+          max_output_tokens: 1000,
+          base_url: "https://api.openai.com/v1/responses"
+        )
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["max_output_tokens"] == 1000
+    end
   end
 
   describe "decode_response/1" do
@@ -1184,6 +1211,7 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       tools: Keyword.get(opts, :tools),
       tool_choice: Keyword.get(opts, :tool_choice),
       reasoning_effort: Keyword.get(opts, :reasoning_effort),
+      base_url: Keyword.get(opts, :base_url),
       provider_options: provider_opts
     }
 
