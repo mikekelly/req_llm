@@ -346,7 +346,14 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     text_format = encode_text_format(provider_opts[:response_format])
 
     # Build body without previous_response_id
-    store = if opts_map[:store] != nil, do: opts_map[:store], else: provider_opts[:store]
+    # Default store to false for ChatGPT Codex endpoint (which requires it)
+    store =
+      cond do
+        opts_map[:store] != nil -> opts_map[:store]
+        provider_opts[:store] != nil -> provider_opts[:store]
+        is_codex_endpoint?(opts_map[:base_url]) -> false
+        true -> nil
+      end
 
     Map.new()
     |> Map.put("model", model_name)
@@ -548,6 +555,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp maybe_put_string(map, _key, nil), do: map
   defp maybe_put_string(map, key, value), do: Map.put(map, key, value)
+
+  defp is_codex_endpoint?(nil), do: false
+  defp is_codex_endpoint?(url) when is_binary(url), do: String.contains?(url, "backend-api/codex")
 
   defp encode_tools_if_any(request) do
     case request.options[:tools] do
