@@ -374,12 +374,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> maybe_put_string("text", text_format)
       |> maybe_put_string("store", store)
 
-    # Codex endpoint doesn't support max_output_tokens
-    if is_codex do
-      Map.delete(body, "max_output_tokens")
-    else
-      body
-    end
+    body
   end
 
   defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do
@@ -631,14 +626,13 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp encode_tool_for_responses_api(%ReqLLM.Tool{} = tool) do
     schema = ReqLLM.Tool.to_schema(tool)
     function_def = schema["function"]
-    params = normalize_parameters_for_strict(function_def["parameters"])
+    params = function_def["parameters"]
 
     %{
       "type" => "function",
       "name" => function_def["name"],
       "description" => function_def["description"],
-      "parameters" => params,
-      "strict" => true
+      "parameters" => params
     }
   end
 
@@ -648,28 +642,24 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     if function_def do
       name = function_def["name"] || function_def[:name]
       description = function_def["description"] || function_def[:description]
-      raw_params = function_def["parameters"] || function_def[:parameters]
-      params = normalize_parameters_for_strict(raw_params)
+      params = function_def["parameters"] || function_def[:parameters]
 
       %{
         "type" => "function",
         "name" => name,
         "description" => description,
-        "parameters" => params,
-        "strict" => true
+        "parameters" => params
       }
     else
       name = tool_schema["name"] || tool_schema[:name]
       description = tool_schema["description"] || tool_schema[:description]
-      raw_params = tool_schema["parameters"] || tool_schema[:parameters]
-      params = normalize_parameters_for_strict(raw_params)
+      params = tool_schema["parameters"] || tool_schema[:parameters]
 
       %{
         "type" => "function",
         "name" => name,
         "description" => description,
-        "parameters" => params,
-        "strict" => true
+        "parameters" => params
       }
     end
   end
