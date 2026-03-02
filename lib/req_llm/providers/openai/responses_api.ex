@@ -374,7 +374,12 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> maybe_put_string("text", text_format)
       |> maybe_put_string("store", store)
 
-    body
+    # Codex endpoint doesn't support max_output_tokens
+    if is_codex do
+      Map.delete(body, "max_output_tokens")
+    else
+      body
+    end
   end
 
   defp encode_input_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}, type) do
