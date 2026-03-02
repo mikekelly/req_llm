@@ -229,18 +229,22 @@ defmodule ReqLLM.Streaming do
       # start_fn: return the server pid
       fn -> server_pid end,
       # next_fn: get next chunk from server
-      fn server ->
-        case StreamServer.next(server, timeout) do
-          {:ok, chunk} ->
-            {[chunk], server}
+      fn
+        :halted ->
+          {:halt, :halted}
 
-          :halt ->
-            {:halt, server}
+        server ->
+          case StreamServer.next(server, timeout) do
+            {:ok, chunk} ->
+              {[chunk], server}
 
-          {:error, reason} ->
-            Logger.error("Stream error: #{inspect(reason)}")
-            {:halt, server}
-        end
+            :halt ->
+              {:halt, server}
+
+            {:error, reason} ->
+              Logger.error("Stream error: #{inspect(reason)}")
+              {[{:error, reason}], :halted}
+          end
       end,
       # after_fn: no-op, cleanup handled by cancel function
       fn _server -> :ok end
