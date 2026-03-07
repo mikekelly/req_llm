@@ -83,14 +83,23 @@ defmodule ReqLLM.Streaming do
         start_stream_ws(provider_mod, model, context, opts)
 
       :auto ->
-        if ws_eligible?(provider_mod) do
-          case start_stream_ws(provider_mod, model, context, opts) do
-            {:ok, _} = success ->
-              success
+        if ws_eligible?(provider_mod, opts) do
+          try do
+            case start_stream_ws(provider_mod, model, context, opts) do
+              {:ok, _} = success ->
+                success
 
-            {:error, reason} ->
+              {:error, reason} ->
+                Logger.warning(
+                  "WebSocket streaming failed (#{inspect(reason)}), falling back to SSE"
+                )
+
+                start_stream_sse(provider_mod, model, context, opts)
+            end
+          rescue
+            e ->
               Logger.warning(
-                "WebSocket streaming failed (#{inspect(reason)}), falling back to SSE"
+                "WebSocket streaming raised (#{inspect(e)}), falling back to SSE"
               )
 
               start_stream_sse(provider_mod, model, context, opts)
@@ -101,8 +110,25 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  # Only OpenAI supports WebSocket streaming via the Responses API
-  defp ws_eligible?(provider_mod), do: provider_mod == ReqLLM.Providers.OpenAI
+  # Only standard OpenAI (api.openai.com) supports WebSocket streaming.
+  # Codex OAuth endpoints (backend-api/codex) do not support WS.
+  defp ws_eligible?(provider_mod, opts) do
+    if provider_mod == ReqLLM.Providers.OpenAI do
+      base_url = get_effective_base_url(opts)
+      not is_codex_endpoint?(base_url)
+    else
+      false
+    end
+  end
+
+  defp get_effective_base_url(opts) do
+    provider_opts = Keyword.get(opts, :provider_options, [])
+    Keyword.get(provider_opts, :base_url) ||
+      Application.get_env(:req_llm, :openai_base_url, "https://api.openai.com")
+  end
+
+  defp is_codex_endpoint?(nil), do: false
+  defp is_codex_endpoint?(url) when is_binary(url), do: String.contains?(url, "backend-api/codex")
 
   @doc false
   def build_ws_url(base_url) do
@@ -150,16 +176,16 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  defp start_ws_manager(_model, opts, server_pid) do
+  defp start_ws_manager(model, opts, server_pid) do
     provider_opts = Keyword.get(opts, :provider_options, [])
 
     base_url =
       Keyword.get(provider_opts, :base_url) ||
-        Application.get_env(:req_llm, :openai_base_url, "https://api.openai.com")
+        ReqLLM.Provider.Options.effective_base_url(ReqLLM.Providers.OpenAI, model, opts)
 
     api_key =
       Keyword.get(provider_opts, :api_key) ||
-        ReqLLM.Keys.get!(:openai)
+        ReqLLM.Keys.get!(model, opts)
 
     ws_url = build_ws_url(base_url)
 
