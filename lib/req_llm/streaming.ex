@@ -14,11 +14,20 @@ defmodule ReqLLM.Streaming do
   - `FinchClient` - HTTP transport layer using Finch for streaming requests
   - `StreamResponse` - User-facing API providing streams and metadata tasks
 
+  ## Transport modes
+
+  The `:transport` option controls how streaming connects to the provider:
+
+  - `:auto` (default) - Uses WebSocket for OpenAI providers, SSE for others.
+    Falls back to SSE if the WS connection fails.
+  - `:websocket` - Forces WebSocket transport. Returns `{:error, _}` on failure.
+  - `:sse` - Forces SSE transport (the original HTTP streaming path).
+
   ## Flow
 
   1. `start_stream/4` creates StreamServer with provider configuration
-  2. FinchClient builds provider-specific HTTP request and starts streaming
-  3. HTTP task is attached to StreamServer for monitoring and cleanup
+  2. Transport layer (WS or Finch/SSE) connects and starts streaming
+  3. Events are forwarded to StreamServer for processing
   4. StreamResponse provides lazy stream using `Stream.resource/3`
   5. Metadata task runs concurrently to collect usage and finish_reason
   6. Cancel function provides cleanup of all components
@@ -44,97 +53,80 @@ defmodule ReqLLM.Streaming do
   """
 
   alias ReqLLM.{Context, StreamResponse, StreamResponse.MetadataHandle, StreamServer}
+  alias ReqLLM.Streaming.WebSocketManager
 
   require Logger
 
   @doc """
-  Start a streaming session with coordinated StreamServer, FinchClient, and StreamResponse.
-
-  This is the main entry point for streaming operations. It orchestrates all components
-  to provide a cohesive streaming experience with concurrent metadata collection.
-
-  ## Parameters
-
-    * `provider_mod` - Provider module (e.g., `ReqLLM.Providers.Anthropic`)
-    * `model` - Model configuration struct
-    * `context` - Conversation context with messages
-    * `opts` - Additional options (timeout, fixture_path, etc.)
-
-  ## Returns
-
-    * `{:ok, stream_response}` - StreamResponse with stream and metadata_handle
-    * `{:error, reason}` - Failed to start streaming components
+  Start a streaming session with coordinated StreamServer and transport.
 
   ## Options
 
+    * `:transport` - Transport mode: `:auto` (default), `:websocket`, or `:sse`
     * `:timeout` - HTTP request timeout in milliseconds (default: 30_000)
-    * `:metadata_timeout` - Metadata collection timeout in milliseconds (default: 300_000)
+    * `:metadata_timeout` - Metadata collection timeout (default: 300_000)
     * `:fixture_path` - Path for test fixture capture (testing only)
     * `:finch_name` - Finch pool name (default: ReqLLM.Finch)
+    * `:provider_options` - Provider-specific options (e.g., `previous_response_id`)
 
-  ## Examples
-
-      # Basic streaming
-      {:ok, stream_response} = ReqLLM.Streaming.start_stream(
-        ReqLLM.Providers.Anthropic,
-        model,
-        context,
-        []
-      )
-
-      # With options
-      {:ok, stream_response} = ReqLLM.Streaming.start_stream(
-        provider_mod,
-        model,
-        context,
-        timeout: 60_000,
-        fixture_path: "/tmp/test_fixture.json"
-      )
-
-  ## Error Cases
-
-  The function can fail at several points:
-
-  - StreamServer fails to start
-  - Provider's build_stream_request/4 fails
-  - HTTP streaming task fails to start
-  - Task attachment fails
-
-  All failures return `{:error, reason}` with descriptive error information.
   """
   @spec start_stream(module(), LLMDB.Model.t(), Context.t(), keyword()) ::
           {:ok, StreamResponse.t()} | {:error, term()}
   def start_stream(provider_mod, model, context, opts \\ []) do
+    transport = Keyword.get(opts, :transport, :auto)
+
+    case transport do
+      :sse ->
+        start_stream_sse(provider_mod, model, context, opts)
+
+      :websocket ->
+        start_stream_ws(provider_mod, model, context, opts)
+
+      :auto ->
+        if ws_eligible?(provider_mod) do
+          case start_stream_ws(provider_mod, model, context, opts) do
+            {:ok, _} = success ->
+              success
+
+            {:error, reason} ->
+              Logger.warning(
+                "WebSocket streaming failed (#{inspect(reason)}), falling back to SSE"
+              )
+
+              start_stream_sse(provider_mod, model, context, opts)
+          end
+        else
+          start_stream_sse(provider_mod, model, context, opts)
+        end
+    end
+  end
+
+  # Only OpenAI supports WebSocket streaming via the Responses API
+  defp ws_eligible?(provider_mod), do: provider_mod == ReqLLM.Providers.OpenAI
+
+  @doc false
+  def build_ws_url(base_url) do
+    uri = URI.parse(base_url)
+
+    path =
+      case uri.path do
+        nil -> "/v1/responses"
+        "" -> "/v1/responses"
+        p -> if String.ends_with?(p, "/responses"), do: p, else: p <> "/responses"
+      end
+
+    URI.to_string(%{uri | path: path})
+  end
+
+  # ---------------------------------------------------------------------------
+  # SSE transport (original path)
+  # ---------------------------------------------------------------------------
+
+  defp start_stream_sse(provider_mod, model, context, opts) do
     with {:ok, server_pid} <- start_stream_server(provider_mod, model, opts),
          {:ok, _http_task_pid, _http_context, _canonical_json} <-
            start_http_streaming(provider_mod, model, context, opts, server_pid) do
-      # Create lazy stream using Stream.resource
-      default_timeout =
-        Application.get_env(
-          :req_llm,
-          :stream_receive_timeout,
-          Application.get_env(:req_llm, :receive_timeout, 30_000)
-        )
-
-      receive_timeout = Keyword.get(opts, :receive_timeout, default_timeout)
-      stream = create_lazy_stream(server_pid, receive_timeout)
-
-      # Start metadata collection handle
-      metadata_handle = start_metadata_handle(server_pid, opts)
-
-      # Create cancel function
-      cancel_fn = fn -> StreamServer.cancel(server_pid) end
-
-      # Build StreamResponse
-      stream_response = %StreamResponse{
-        stream: stream,
-        metadata_handle: metadata_handle,
-        cancel: cancel_fn,
-        model: model,
-        context: context
-      }
-
-      {:ok, stream_response}
+      build_stream_response(server_pid, model, context, opts)
     else
       {:error, reason} ->
         Logger.error("Failed to start streaming: #{inspect(reason)}")
@@ -142,7 +134,115 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  # Start StreamServer with provider configuration
+  # ---------------------------------------------------------------------------
+  # WebSocket transport
+  # ---------------------------------------------------------------------------
+
+  defp start_stream_ws(provider_mod, model, context, opts) do
+    with {:ok, server_pid} <- start_stream_server(provider_mod, model, opts),
+         {:ok, ws_pid} <- start_ws_manager(model, opts, server_pid),
+         :ok <- send_ws_request(provider_mod, model, context, opts, ws_pid, server_pid) do
+      build_stream_response(server_pid, model, context, opts)
+    else
+      {:error, reason} ->
+        Logger.error("Failed to start WebSocket streaming: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  defp start_ws_manager(_model, opts, server_pid) do
+    provider_opts = Keyword.get(opts, :provider_options, [])
+
+    base_url =
+      Keyword.get(provider_opts, :base_url) ||
+        Application.get_env(:req_llm, :openai_base_url, "https://api.openai.com")
+
+    api_key =
+      Keyword.get(provider_opts, :api_key) ||
+        ReqLLM.Keys.get!(:openai)
+
+    ws_url = build_ws_url(base_url)
+
+    case WebSocketManager.start(
+           base_url: ws_url,
+           api_key: api_key,
+           stream_server_pid: server_pid
+         ) do
+      {:ok, pid} ->
+        case WebSocketManager.await_connected(pid, 10_000) do
+          :ok -> {:ok, pid}
+          {:error, reason} -> {:error, {:ws_connect_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:ws_start_failed, reason}}
+    end
+  end
+
+  defp send_ws_request(provider_mod, model, context, opts, ws_pid, server_pid) do
+    provider_opts = Keyword.get(opts, :provider_options, [])
+    finch_name = Keyword.get(opts, :finch_name, ReqLLM.Finch)
+
+    # Build body by calling attach_stream (which builds a Finch request),
+    # then extracting and decoding the JSON body from the Finch struct.
+    case provider_mod.attach_stream(model, context, opts, finch_name) do
+      {:ok, %Finch.Request{body: body_json}} ->
+        body_map = Jason.decode!(body_json)
+
+        # Inject previous_response_id if provided
+        body_map =
+          case Keyword.get(provider_opts, :previous_response_id) do
+            nil -> body_map
+            id -> Map.put(body_map, "previous_response_id", id)
+          end
+
+        # Attach WS manager PID to StreamServer for lifecycle coupling
+        StreamServer.attach_http_task(server_pid, ws_pid)
+
+        case WebSocketManager.send_request(ws_pid, body_map) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:ws_send_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:provider_build_failed, reason}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Shared: build StreamResponse from a running StreamServer
+  # ---------------------------------------------------------------------------
+
+  defp build_stream_response(server_pid, model, context, opts) do
+    default_timeout =
+      Application.get_env(
+        :req_llm,
+        :stream_receive_timeout,
+        Application.get_env(:req_llm, :receive_timeout, 30_000)
+      )
+
+    receive_timeout = Keyword.get(opts, :receive_timeout, default_timeout)
+    stream = create_lazy_stream(server_pid, receive_timeout)
+
+    metadata_handle = start_metadata_handle(server_pid, opts)
+
+    cancel_fn = fn -> StreamServer.cancel(server_pid) end
+
+    stream_response = %StreamResponse{
+      stream: stream,
+      metadata_handle: metadata_handle,
+      cancel: cancel_fn,
+      model: model,
+      context: context
+    }
+
+    {:ok, stream_response}
+  end
+
+  # ---------------------------------------------------------------------------
+  # StreamServer setup
+  # ---------------------------------------------------------------------------
+
   defp start_stream_server(provider_mod, model, opts) do
     server_opts = [
       provider_mod: provider_mod,
@@ -164,7 +264,7 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  # Start HTTP streaming through StreamServer
+  # Start HTTP streaming through StreamServer (SSE path)
   defp start_http_streaming(provider_mod, model, context, opts, stream_server_pid) do
     finch_name = Keyword.get(opts, :finch_name, ReqLLM.Finch)
 

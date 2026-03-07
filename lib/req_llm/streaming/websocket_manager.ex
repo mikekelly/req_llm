@@ -71,6 +71,28 @@ defmodule ReqLLM.Streaming.WebSocketManager do
   end
 
   @doc """
+  Start a WebSocketManager without linking to the calling process.
+
+  Useful when the caller wants the WS manager to fail independently (e.g.,
+  in the SSE-fallback path where a WS failure should not crash the caller).
+  """
+  @spec start(keyword()) :: GenServer.on_start()
+  def start(opts) do
+    GenServer.start(__MODULE__, opts)
+  end
+
+  @doc """
+  Block until the WebSocket upgrade completes and the manager is ready to
+  send requests. Returns `:ok` on success or `{:error, reason}` on failure.
+
+  If the manager is already connected, returns `:ok` immediately.
+  """
+  @spec await_connected(pid(), timeout()) :: :ok | {:error, term()}
+  def await_connected(pid, timeout \\ 10_000) do
+    GenServer.call(pid, :await_connected, timeout)
+  end
+
+  @doc """
   Send a `response.create` request over the open WebSocket connection.
 
   `body` is the raw request map (model, input, tools, etc.). It is merged with
@@ -147,13 +169,28 @@ defmodule ReqLLM.Streaming.WebSocketManager do
       # Warm-up caller (GenServer.call ref parked here until response.completed arrives)
       warm_up_caller: nil,
       # Idle timeout timer reference
-      idle_timer: nil
+      idle_timer: nil,
+      # Callers parked by await_connected/2
+      connect_callers: []
     }
 
     # Initiate connection asynchronously (send message to self)
     send(self(), :connect)
 
     {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call(:await_connected, _from, %{status: :connected} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:await_connected, from, %{status: :connecting} = state) do
+    {:noreply, %{state | connect_callers: [from | state.connect_callers]}}
+  end
+
+  def handle_call(:await_connected, _from, %{status: status} = state) do
+    {:reply, {:error, status}, state}
   end
 
   @impl GenServer
@@ -222,7 +259,8 @@ defmodule ReqLLM.Streaming.WebSocketManager do
 
       {:error, reason} ->
         Logger.error("WebSocketManager: connection failed: #{inspect(reason)}")
-        {:stop, {:error, :connection_failed}, %{state | status: {:error, :connection_failed}}}
+        Enum.each(state.connect_callers, &GenServer.reply(&1, {:error, :connection_failed}))
+        {:stop, {:error, :connection_failed}, %{state | status: {:error, :connection_failed}, connect_callers: []}}
     end
   end
 
@@ -326,7 +364,9 @@ defmodule ReqLLM.Streaming.WebSocketManager do
       case Mint.WebSocket.new(state.conn, ref, status, state.upgrade_headers) do
         {:ok, conn, websocket} ->
           Logger.debug("WebSocketManager: WebSocket upgrade complete")
-          {:ok, %{state | conn: conn, websocket: websocket, status: :connected}}
+          new_state = %{state | conn: conn, websocket: websocket, status: :connected}
+          Enum.each(new_state.connect_callers, &GenServer.reply(&1, :ok))
+          {:ok, %{new_state | connect_callers: []}}
 
         {:error, reason} ->
           Logger.error("WebSocketManager: WebSocket promotion failed: #{inspect(reason)}")
@@ -335,9 +375,17 @@ defmodule ReqLLM.Streaming.WebSocketManager do
       end
     else
       Logger.error("WebSocketManager: upgrade rejected with status #{status}")
-      {:stop, {:error, {:upgrade_failed, status}},
-       %{state | status: {:error, {:upgrade_failed, status}}}}
+      error = {:error, {:upgrade_failed, status}}
+      Enum.each(state.connect_callers, &GenServer.reply(&1, error))
+      {:stop, error,
+       %{state | status: {:error, {:upgrade_failed, status}}, connect_callers: []}}
     end
+  end
+
+  defp handle_mint_response({:data, ref, _data}, %{request_ref: ref, websocket: nil} = state) do
+    # Data received before upgrade completed (e.g., HTTP error body). Ignore —
+    # the :done handler will stop the process with the non-101 status.
+    {:ok, state}
   end
 
   defp handle_mint_response({:data, ref, data}, %{request_ref: ref} = state) do
