@@ -110,25 +110,12 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  # Only standard OpenAI (api.openai.com) supports WebSocket streaming.
-  # Codex OAuth endpoints (backend-api/codex) do not support WS.
-  defp ws_eligible?(provider_mod, opts) do
-    if provider_mod == ReqLLM.Providers.OpenAI do
-      base_url = get_effective_base_url(opts)
-      not is_codex_endpoint?(base_url)
-    else
-      false
-    end
+  # Only OpenAI supports WebSocket streaming via the Responses API.
+  # WS always connects to api.openai.com regardless of the HTTP base_url
+  # (Codex OAuth models use chatgpt.com for SSE but api.openai.com for WS).
+  defp ws_eligible?(provider_mod, _opts) do
+    provider_mod == ReqLLM.Providers.OpenAI
   end
-
-  defp get_effective_base_url(opts) do
-    provider_opts = Keyword.get(opts, :provider_options, [])
-    Keyword.get(provider_opts, :base_url) ||
-      Application.get_env(:req_llm, :openai_base_url, "https://api.openai.com")
-  end
-
-  defp is_codex_endpoint?(nil), do: false
-  defp is_codex_endpoint?(url) when is_binary(url), do: String.contains?(url, "backend-api/codex")
 
   @doc false
   def build_ws_url(base_url) do
@@ -176,18 +163,15 @@ defmodule ReqLLM.Streaming do
     end
   end
 
-  defp start_ws_manager(model, opts, server_pid) do
-    provider_opts = Keyword.get(opts, :provider_options, [])
+  defp start_ws_manager(_model, opts, server_pid) do
+    # WS always connects to api.openai.com, even for Codex OAuth models.
+    # The Codex CLI does the same: WS goes to api.openai.com, SSE goes to
+    # chatgpt.com/backend-api/codex. The OAuth token works for both.
+    ws_url = build_ws_url("https://api.openai.com")
 
-    base_url =
-      Keyword.get(provider_opts, :base_url) ||
-        ReqLLM.Provider.Options.effective_base_url(ReqLLM.Providers.OpenAI, model, opts)
-
-    api_key =
-      Keyword.get(provider_opts, :api_key) ||
-        ReqLLM.Keys.get!(model, opts)
-
-    ws_url = build_ws_url(base_url)
+    # Get API key from opts (Him.LLM.Client puts the OAuth token here)
+    # or fall back to standard key resolution for non-Codex usage
+    api_key = Keyword.get(opts, :api_key) || ReqLLM.Keys.get!(:openai)
 
     case WebSocketManager.start(
            base_url: ws_url,

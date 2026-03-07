@@ -333,7 +333,10 @@ defmodule ReqLLM.Streaming.WebSocketManager do
   defp mint_scheme(other), do: String.to_atom(other)
 
   defp auth_headers(api_key) do
-    [{"authorization", "Bearer #{api_key}"}]
+    [
+      {"authorization", "Bearer #{api_key}"},
+      {"openai-beta", "responses-websocket=v1"}
+    ]
   end
 
   # ---------------------------------------------------------------------------
