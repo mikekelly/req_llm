@@ -1081,6 +1081,124 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp normalize_finish_reason("content_filter"), do: :content_filter
   defp normalize_finish_reason(_), do: :error
 
+  @doc """
+  Call the OpenAI /responses/compact endpoint to compress conversation context.
+
+  ## Parameters
+    * `model` - LLMDB.Model struct
+    * `input_items` - List of Responses API input items (maps with string keys)
+    * `instructions` - System instructions string, or nil
+    * `opts` - Options (must include API key access)
+
+  ## Returns
+    * `{:ok, compacted_items}` - List of compacted ResponseItem maps
+    * `{:error, reason}` - Compaction failed
+  """
+  @spec compact(struct(), list(map()), String.t() | nil, keyword()) ::
+          {:ok, list(map())} | {:error, term()}
+  def compact(model, input_items, instructions, opts) do
+    api_key = ReqLLM.Keys.get!(model, opts)
+    base_url = Keyword.get(opts, :base_url) || ReqLLM.Providers.OpenAI.base_url()
+    url = "#{base_url}/responses/compact"
+
+    headers = [
+      {"Authorization", "Bearer #{api_key}"},
+      {"Content-Type", "application/json"}
+    ]
+
+    body = %{
+      "model" => model.id,
+      "input" => input_items
+    }
+
+    body = if instructions, do: Map.put(body, "instructions", instructions), else: body
+
+    finch_request = Finch.build(:post, url, headers, Jason.encode!(body))
+
+    case Finch.request(finch_request, ReqLLM.Finch, receive_timeout: 60_000) do
+      {:ok, %{status: 200, body: resp_body}} ->
+        case Jason.decode(resp_body) do
+          {:ok, %{"output" => items}} when is_list(items) -> {:ok, items}
+          {:ok, other} -> {:ok, [other]}
+          {:error, reason} -> {:error, {:json_decode_failed, reason}}
+        end
+
+      {:ok, %{status: status, body: resp_body}} ->
+        {:error, {:compact_failed, status, resp_body}}
+
+      {:error, reason} ->
+        {:error, {:compact_request_failed, reason}}
+    end
+  end
+
+  @doc """
+  Convert Responses API items (from /responses/compact) back to ReqLLM message format.
+
+  This is the inverse of encode_messages_to_input/1.
+  """
+  @spec decode_compact_items_to_messages(list(map())) :: list(map())
+  def decode_compact_items_to_messages(items) when is_list(items) do
+    Enum.flat_map(items, &decode_single_compact_item/1)
+  end
+
+  @doc false
+  def encode_messages_to_input(messages) when is_list(messages) do
+    Enum.flat_map(messages, &encode_message_to_responses_input/1)
+  end
+
+  defp decode_single_compact_item(%{"role" => "user", "content" => content}) do
+    text = extract_text_from_content(content)
+    [%{"role" => "user", "content" => text}]
+  end
+
+  defp decode_single_compact_item(%{"role" => "assistant", "content" => content}) do
+    text = extract_text_from_content(content)
+    [%{"role" => "assistant", "content" => text}]
+  end
+
+  defp decode_single_compact_item(%{"type" => "function_call"} = item) do
+    [%{
+      "role" => "assistant",
+      "content" => "",
+      "tool_calls" => [%{
+        "id" => item["call_id"] || item["id"],
+        "type" => "function",
+        "function" => %{
+          "name" => item["name"],
+          "arguments" => item["arguments"] || "{}"
+        }
+      }]
+    }]
+  end
+
+  defp decode_single_compact_item(%{"type" => "function_call_output"} = item) do
+    [%{
+      "role" => "tool",
+      "tool_call_id" => item["call_id"],
+      "content" => item["output"] || ""
+    }]
+  end
+
+  defp decode_single_compact_item(%{"type" => "reasoning"}) do
+    # Skip reasoning items — they're internal to the model and not part of conversation history
+    []
+  end
+
+  defp decode_single_compact_item(_unknown) do
+    []
+  end
+
+  defp extract_text_from_content(content) when is_binary(content), do: content
+
+  defp extract_text_from_content(content) when is_list(content) do
+    content
+    |> Enum.filter(fn c -> c["type"] in ["input_text", "output_text", "text"] end)
+    |> Enum.map(fn c -> c["text"] || "" end)
+    |> Enum.join("")
+  end
+
+  defp extract_text_from_content(_), do: ""
+
   @doc false
   def build_responses_body_from_chunks(chunks, model) do
     state =
