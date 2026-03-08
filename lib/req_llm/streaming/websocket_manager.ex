@@ -146,6 +146,7 @@ defmodule ReqLLM.Streaming.WebSocketManager do
     base_url = Keyword.fetch!(opts, :base_url)
     api_key = Keyword.fetch!(opts, :api_key)
     stream_server_pid = Keyword.fetch!(opts, :stream_server_pid)
+    account_id = Keyword.get(opts, :account_id)
 
     {scheme, host, port, path} = parse_url(base_url)
 
@@ -156,6 +157,7 @@ defmodule ReqLLM.Streaming.WebSocketManager do
       port: port,
       path: path,
       api_key: api_key,
+      account_id: account_id,
       # Mint state
       conn: nil,
       websocket: nil,
@@ -171,7 +173,9 @@ defmodule ReqLLM.Streaming.WebSocketManager do
       # Idle timeout timer reference
       idle_timer: nil,
       # Callers parked by await_connected/2
-      connect_callers: []
+      connect_callers: [],
+      # Error body accumulator for non-101 responses
+      error_body: ""
     }
 
     # Initiate connection asynchronously (send message to self)
@@ -309,13 +313,13 @@ defmodule ReqLLM.Streaming.WebSocketManager do
   # Private: connection setup
   # ---------------------------------------------------------------------------
 
-  defp connect(%{scheme: scheme, host: host, port: port, path: path, api_key: api_key} = state) do
+  defp connect(%{scheme: scheme, host: host, port: port, path: path, api_key: api_key, account_id: account_id} = state) do
     mint_scheme = mint_scheme(scheme)
 
     with {:ok, conn} <-
            Mint.HTTP.connect(mint_scheme, host, port, protocols: [:http1]),
          {:ok, conn, ref} <-
-           Mint.WebSocket.upgrade(:wss, conn, path, auth_headers(api_key),
+           Mint.WebSocket.upgrade(:wss, conn, path, auth_headers(api_key, account_id),
              extensions: [Mint.WebSocket.PerMessageDeflate]
            ) do
       {:ok, %{state | conn: conn, request_ref: ref, status: :connecting}}
@@ -332,11 +336,16 @@ defmodule ReqLLM.Streaming.WebSocketManager do
   defp mint_scheme("http"), do: :http
   defp mint_scheme(other), do: String.to_atom(other)
 
-  defp auth_headers(api_key) do
-    [
+  defp auth_headers(api_key, account_id) do
+    headers = [
       {"authorization", "Bearer #{api_key}"},
       {"openai-beta", "responses-websocket=v1"}
     ]
+
+    case account_id do
+      nil -> headers
+      id -> [{"chatgpt-account-id", id} | headers]
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -377,7 +386,8 @@ defmodule ReqLLM.Streaming.WebSocketManager do
            %{state | status: {:error, {:upgrade_failed, reason}}}}
       end
     else
-      Logger.error("WebSocketManager: upgrade rejected with status #{status}")
+      body_info = if state.error_body != "", do: " (#{state.error_body})", else: ""
+      Logger.error("WebSocketManager: upgrade rejected with status #{status}#{body_info}")
       error = {:error, {:upgrade_failed, status}}
       Enum.each(state.connect_callers, &GenServer.reply(&1, error))
       {:stop, error,
@@ -385,10 +395,10 @@ defmodule ReqLLM.Streaming.WebSocketManager do
     end
   end
 
-  defp handle_mint_response({:data, ref, _data}, %{request_ref: ref, websocket: nil} = state) do
-    # Data received before upgrade completed (e.g., HTTP error body). Ignore —
-    # the :done handler will stop the process with the non-101 status.
-    {:ok, state}
+  defp handle_mint_response({:data, ref, data}, %{request_ref: ref, websocket: nil} = state) do
+    # Data received before upgrade completed (e.g., HTTP error body).
+    # Accumulated and logged when :done fires with the non-101 status.
+    {:ok, %{state | error_body: state.error_body <> data}}
   end
 
   defp handle_mint_response({:data, ref, data}, %{request_ref: ref} = state) do

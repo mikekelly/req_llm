@@ -173,11 +173,19 @@ defmodule ReqLLM.Streaming do
     # or fall back to standard key resolution for non-Codex usage
     api_key = Keyword.get(opts, :api_key) || ReqLLM.Keys.get!(:openai)
 
-    case WebSocketManager.start(
-           base_url: ws_url,
-           api_key: api_key,
-           stream_server_pid: server_pid
-         ) do
+    ws_opts = [
+      base_url: ws_url,
+      api_key: api_key,
+      stream_server_pid: server_pid
+    ]
+
+    ws_opts =
+      case Keyword.get(opts, :account_id) do
+        nil -> ws_opts
+        account_id -> Keyword.put(ws_opts, :account_id, account_id)
+      end
+
+    case WebSocketManager.start(ws_opts) do
       {:ok, pid} ->
         case WebSocketManager.await_connected(pid, 10_000) do
           :ok -> {:ok, pid}
